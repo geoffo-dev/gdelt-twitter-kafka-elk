@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: ELK and Kafka Stack
+
+Parameters:
+  myImageId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-032598fcc7e9d1c7a
+  CIDRRange: 
+    Type: String
+    Default: 0.0.0.0/32
+    Description: Set CidrIp for remote access
+  ElasticsearchClusterSize: 
+    Type: String
+    Default: t2.large
+    AllowedValues: 
+      - t2.micro
+      - t2.large
+    Description: Size of Elastic Search Cluster running ELK stack 
+  KafkaClusterSize: 
+    Type: String
+    Default: t2.large
+    AllowedValues: 
+      - t2.micro
+      - t2.large
+    Description: Size of Kafka Cluster running Kafka and Zookeeper 
+  S3BucketName:
+      Type: String
+      Default: scrapercollectornodebucketgowen
+      AllowedPattern: '[a-z][a-z0-9]*'
+      Description: Name of Amazon S3 bucket for log [a-z][a-z0-9]*
+  # Define which Key Pairs will have access to the instances
+  myKeyPair: 
+    Description: Amazon EC2 Key Pair
+    Type: "AWS::EC2::KeyPair::KeyName"
+
+Resources:   
+  # EC2 Lanch template
+  ELKEc2Instance: 
+    Type: AWS::EC2::Instance
+    Properties: 
+      ImageId: !Ref myImageId
+      KeyName: !Ref myKeyPair
+      InstanceType: !Ref ElasticsearchClusterSize
+      IamInstanceProfile: !Ref KafkaIAMRoleInstanceProfile
+      SecurityGroupIds: 
+        - !GetAtt ELKInstanceSecurityGroup.GroupId
+      UserData:
+        Fn::Base64: 
+          Fn::Sub:
+            - | 
+              #!/bin/bash
+              # Install Elasticsearch
+              # https://www.elastic.co/guide/en/elasticsearch/reference/current/rpm.html
+              # Get ElasticSearch
+              rpm --import https://artifacts.elastic.co/GPG-KEY-elasticsearch
+              touch /etc/yum.repos.d/elasticsearch.repo
+              # Create the repo link
+              cat > /etc/yum.repos.d/elasticsearch.repo << EOL
+              [elasticsearch]
+              name=Elasticsearch repository for 7.x packages
+              baseurl=https://artifacts.elastic.co/packages/7.x/yum
+              gpgcheck=1
+              gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+              enabled=1
+              autorefresh=1
+              type=rpm-md
+              EOL
+              # Now install Elasticsearch
+              yum -y install --enablerepo=elasticsearch elasticsearch 
+              # Configure /etc/elasticsearch/
+              sed -i 's/#network.host: 192.168.0.1/network.host: 0.0.0.0/g' /etc/elasticsearch/elasticsearch.yml
+              sed -i 's/#http.port: 9200/http.port: 9200/g' /etc/elasticsearch/elasticsearch.yml
+              sed -i 's/#discovery.seed_hosts: \[\"host1\", \"host2\"\]/discovery.seed_hosts: \[\"localhost\", \"\[::1\]\"\]/g' /etc/elasticsearch/elasticsearch.yml
+              sed -i 's/#node.name: node-1/node.name: node-1/g' /etc/elasticsearch/elasticsearch.yml
+              sed -i 's/#cluster.initial_master_nodes: \[\"node-1\", \"node-2\"\]/cluster.initial_master_nodes: \[\"node-1\"\]/g' /etc/elasticsearch/elasticsearch.yml #Not sure this is needed for single node clusters
+              # Start Elasticsearch
+              systemctl enable elasticsearch
+              service elasticsearch start
+              # Check Health
+              curl -X GET "localhost:9200/_cat/health?v&pretty"
+
+              # Install Kibana
+              # https://www.elastic.co/guide/en/kibana/current/rpm.html 
+              # Create the repo link
+              cat > /etc/yum.repos.d/kibana.repo << EOL
+              [kibana-7.x]
+              name=Kibana repository for 7.x packages
+              baseurl=https://artifacts.elastic.co/packages/7.x/yum
+              gpgcheck=1
+              gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+              enabled=1
+              autorefresh=1
+              type=rpm-md
+              EOL
+              # Install Kibana
+              yum -y install kibana
+              systemctl enable kibana
+              # Set Config
+              sed -i 's/#server.host: \"localhost\"/server.host: \"0.0.0.0\"/g' /etc/kibana/kibana.yml
+              sed -i 's/#elasticsearch.hosts: \[\"http:\/\/localhost:9200\"\]/elasticsearch.hosts: \[\"http:\/\/127.0.0.1:9200\"\]/g' /etc/kibana/kibana.yml
+              sed -i 's/#logging.dest: stdout/logging.dest: \/var\/log\/kibana\/kibana.log/g' /etc/kibana/kibana.yml
+              # Start Kibana
+              service kibana start
+
+              # Install logstash.
+              cat > /etc/yum.repos.d/logstash.repo << EOL
+              [logstash-7.x]
+              name=Elastic repository for 7.x packages
+              baseurl=https://artifacts.elastic.co/packages/7.x/yum
+              gpgcheck=1
+              gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch
+              enabled=1
+              autorefresh=1
+              type=rpm-md
+              EOL
+              # Install logstash - Need to install java to get $JAVA_HOME and create startup scripts
+              yum -y install logstash java
+              ./usr/share/logstash/bin/system-install
+              systemctl enable logstash
+              # Configure logstash
+              cat > /etc/logstash/conf.d/logstash-twitter.conf << EOL
+              input { 
+                  kafka { 
+                          bootstrap_servers => "${KafkaIP}:9092" 
+                          topics => ["twitter"] 
+                          codec => "json"
+                  } 
+              } 
+              output { 
+                  elasticsearch {
+                          hosts => ["localhost:9200"]
+                          index => 'twitter'
+                  }
+                  s3{
+                      region => "${AWS::Region}"               
+                      bucket => "${S3BucketName}"             
+                      size_file => 1048576
+                      prefix => "twitter/"                       
+                      time_file => 5                          
+                      codec => "json"                        
+                      canned_acl => "private"              
+                  }
+              } 
+              EOL
+              cat > /etc/logstash/conf.d/logstash-gdelt.conf << EOL
+              input { 
+                  kafka { 
+                          bootstrap_servers => "${KafkaIP}:9092" 
+                          topics => ["gdelt"] 
+                          codec => "json"
+                  } 
+              } 
+              output { 
+                  elasticsearch {
+                          hosts => ["localhost:9200"]
+                          index => 'gdelt'
+                  }
+                  s3{
+                      region => "${AWS::Region}"               
+                      bucket => "${S3BucketName}"             
+                      size_file => 1048576
+                      prefix => "gdelt/"                       
+                      time_file => 5                          
+                      codec => "json"                        
+                      canned_acl => "private"              
+                  }
+              } 
+              EOL
+
+              # Setup the pipelines
+              cat > /etc/logstash/pipelines.yml  << EOL
+              - pipeline.id: twitter
+                path.config: "/etc/logstash/conf.d/logstash-twitter.conf"
+              - pipeline.id: gdelt
+                path.config: "/etc/logstash/conf.d/logstash-gdelt.conf"
+              EOL
+
+              # Start logstash
+              service logstash start
+            - KafkaIP: !GetAtt KafkaEc2Instance.PrivateDnsName
+              S3BucketName: !Ref s3bucket
+
+  ELKInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupName: ELK SecurityGroup
+        GroupDescription: Allow ssh to client host
+        SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          Description: SSH
+          CidrIp: !Ref CIDRRange
+        - IpProtocol: tcp
+          FromPort: 5601
+          ToPort: 5601
+          CidrIp: !Ref CIDRRange
+          Description: Kibana
+        - IpProtocol: tcp
+          FromPort: 9200
+          ToPort: 9200
+          CidrIp: !Ref CIDRRange
+          Description: Elasticsearch
+        
+  # IAM Role - Needed to allow to write to S3 Bucket
+  ELKIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        - PolicyName: S3BucketWriteAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource: !Join [ "/" , [ !GetAtt [s3bucket, Arn] , "*" ] ]
+  
+  KafkaIAMRoleInstanceProfile: 
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      Path: "/"
+      Roles: 
+        - 
+          Ref: "ELKIAMRole"
+
+  # S3 Bucket for storing the data
+  s3bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref "S3BucketName"
+      AccessControl: Private
+
+  KafkaEc2Instance: 
+    Type: AWS::EC2::Instance
+    Properties: 
+      ImageId: !Ref myImageId
+      KeyName: !Ref myKeyPair
+      InstanceType: !Ref KafkaClusterSize
+      SecurityGroupIds:
+        - !GetAtt [KafkaInstanceSecurityGroup, GroupId]
+      UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Install Java
+            yum -y install java
+
+            # Get the Kafka binaries, extract to /opt
+            mkdir /opt/kafka
+            cd /opt/kafka
+            wget http://apache.mirror.anlx.net/kafka/2.6.0/kafka_2.13-2.6.0.tgz
+            tar -xvzf kafka_2.13-2.6.0.tgz
+            mv kafka_2.13-2.6.0/* .
+            rmdir /opt/kafka/kafka_2.13-2.6.0
+
+            # Create the services
+            cat > /lib/systemd/system/zookeeper.service << EOL
+            [Unit]
+            Requires=network.target remote-fs.target
+            After=network.target remote-fs.target
+
+            [Service]
+            Type=simple
+            User=root
+            ExecStart=/opt/kafka/bin/zookeeper-server-start.sh /opt/kafka/config/zookeeper.properties
+            ExecStop=/opt/kafka/bin/zookeeper-server-stop.sh
+            Restart=on-abnormal
+
+            [Install]
+            WantedBy=multi-user.target
+            EOL
+            cat > /lib/systemd/system/kafka.service << EOL
+            [Unit]
+            Requires=network.target remote-fs.target zookeeper.service
+            After=network.target remote-fs.target zookeeper.service
+
+            [Service]
+            Type=simple
+            User=root
+            ExecStart=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
+            ExecStop=/opt/kafka/bin/kafka-server-stop.sh
+            Restart=on-abnormal
+
+            [Install]
+            WantedBy=multi-user.target
+            EOL
+
+            # Get the Kafka hostname so it can be added to the advertised listeners
+            my_ip=$(curl http://169.254.169.254/latest/meta-data/public-hostname)
+
+            # Configure Kafka
+            sed -i 's/#listeners=PLAINTEXT:\/\/:9092/listeners=PLAINTEXT:\/\/:9092/g' /opt/kafka/config/server.properties
+            sed -i 's/log.dirs=\/tmp\/kafka-logs/log.dirs=\/var\/log\/kafka-logs/g' /opt/kafka/config/server.properties
+            sed -i "s/#advertised.listeners=PLAINTEXT:\/\/your.host.name:9092/advertised.listeners=PLAINTEXT:\/\/"$my_ip":9092/g" /opt/kafka/config/server.properties
+
+            # Reload daemons
+            systemctl daemon-reload
+            # Create the logs directory
+            mkdir -p /var/log/kafka-logs
+            # Start the services
+            sudo systemctl start zookeeper.service
+            sudo systemctl start kafka.service
+            #Enable at startup
+            systemctl enable zookeeper.service
+            systemctl enable kafka.service
+            # Create topics
+            bin/kafka-topics.sh --create --topic twitter --bootstrap-server localhost:9092
+            bin/kafka-topics.sh --create --topic gdelt --bootstrap-server localhost:9092
+  KafkaInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: KafkaSecurityGroup
+      GroupDescription: Allow ssh to client host
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          Description: SSH
+          CidrIp: !Ref CIDRRange
+        - IpProtocol: tcp
+          FromPort: 9092
+          ToPort: 9092
+          CidrIp: !Ref CIDRRange
+          Description: Kafka
+        - IpProtocol: tcp
+          FromPort: 9092
+          ToPort: 9092
+          Description: Kafka
+          SourceSecurityGroupId: !GetAtt ELKInstanceSecurityGroup.GroupId
